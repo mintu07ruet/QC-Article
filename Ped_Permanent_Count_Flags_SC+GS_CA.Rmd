@@ -1,0 +1,154 @@
+---
+title: "Permanent_Count_Flags_SC+GS"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(readr)
+library(tidyr)
+```
+
+
+
+
+Sample input data
+```{r}
+#Here the input data is for a specific permanent counter, but you can also input data for multiple counters at once and add a grouping by flow_id or flow_name. Some of the variables included here are redundant/uneeded but the ones that are utilized are date, hour, count, weekday (which is just derived from day which is just derived from date), year, and season. Season here is just a boolean essentially being used to filter out winter months, which can be done/defined depending on user discretion depending on context or best practice.
+
+input_data <- read_csv("C:/UC Berkeley Project Backup/AT Census/Pedestrain_Processed Data/Eco_combined_data_rural_vs_urban_before_QA_QC.csv")
+
+#read in data here. I've included a sample dataset of the permanent counter for Sakatah Singing Hills State Trail - Eastbound Cyclists at Morristown
+```
+
+# rename some of the columns
+```{r}
+colnames(input_data)
+```
+
+
+
+
+
+# Split the time to hour
+```{r}
+library(lubridate)
+# parese date
+a <- hms(as.character(input_data$starttime))
+input_data$hour=hour(a)
+head(input_data,25)
+```
+
+
+# drop the 3 days (72 hrs consecutive zero volumes)
+```{r}
+require(dplyr)
+input_data1=input_data  %>% mutate(csum_counts= ave(counts, ID, year,month,day, FUN=cumsum)) %>%
+   mutate(csum_hours= ave(hour, ID, year,month,day, FUN=cumsum)) %>%
+   mutate(consec_flag=ifelse(csum_counts==0 & counts==0 & csum_hours>=72,T,F))%>%
+   mutate(consec_flag1=ifelse(csum_counts==0 & counts==0 & csum_hours<72,T,F))
+
+```
+# Consider only valid data
+```{r}
+input_data2=subset(input_data1, consec_flag==FALSE & consec_flag1==FALSE)
+input_data2=input_data2 %>% mutate(season=ifelse(month<4 & month>10,T,F))
+```
+
+
+```{r}
+check=subset(input_data2,ID==41347 & year==2018)
+```
+
+
+# identify weekday and weekend high hourly volume threshold
+```{r}
+weekday=subset(input_data2, weekday_Status==0)
+weekday_dv=aggregate(counts~ID+year+month+day,FUN =sum,data=weekday)
+colnames(weekday_dv)[colnames(weekday_dv) == 'counts'] <- 'daily_volume'
+weekday1=merge(weekday,weekday_dv,by=c('ID','year','month','day'))
+weekend=subset(input_data2, weekday_Status==1)
+weekend_dv=aggregate(counts~ID+year+month+day,FUN=sum,data=weekend)
+colnames(weekend_dv)[colnames(weekend_dv) == 'counts'] <- 'daily_volume'
+weekend1=merge(weekend,weekend_dv,by=c('ID','year','month','day'))
+head(weekend1,8)
+```
+
+# do the scatter plot and decide the weekday uper threshold
+
+```{r}
+library(tidyverse)
+ggplot(weekday1) +
+    geom_point(aes(x = ID, y = counts))
+```
+# above weekday graph confirms that 5000 is the valid hourly count for the study area in weekday
+
+# do the scatter plot and decide the weekday uper threshold
+
+```{r}
+library(tidyverse)
+ggplot(weekend1) +
+    geom_point(aes(x = ID, y = counts))
+```
+# We will aslo consider 5000 as the valid hourly count in weekends
+# Find the upper threshold for weekdays and weekends
+
+```{r}
+weekday1$upper_threshold==5000
+weekend1$upper_threshold==5000
+weekday2=weekday1%>% mutate(mean_hourly_volume=mean(counts)) %>%
+  mutate(mean_daily_volume=mean(daily_volume))%>%
+  mutate(mean_hourly_ratio=mean_hourly_volume/mean_daily_volume) %>%
+  mutate(max_threshold=5000*mean_hourly_ratio*2)
+```
+`
+```{r}
+weekend2=weekend1%>% mutate(mean_hourly_volume=mean(counts)) %>%
+  mutate(mean_daily_volume=mean(daily_volume))%>%
+  mutate(mean_hourly_ratio=mean_hourly_volume/mean_daily_volume) %>%
+  mutate(max_threshold=5000*mean_hourly_ratio*2)
+```
+
+
+
+
+Flagging (Permanent Counter Method)
+```{r}
+#max_flag: Censor any values greater than what we determined to be possible based on MnDOT data (as mentioned in presentation). Here, those values are 743 users/hr on weekends and 674 users/hr on weekdays
+#night_flag: Flag any values above 10 users/hr in the night time. Here we've defined night as 10pm to 5am inclusive
+#MAD_flag: Mean-absolute-deviation based flagging method. Values are flagged if greather than median + 12*MAD AND greater than 50 users/hr
+#comb_flag: Overall flag (if any of the above flags are true)
+
+input_data_flagged <- input_data2 %>%
+  # 1=weekend, 0=weekday
+  mutate(max_flag = ifelse(weekday_Status==1 & counts>18000 | weekday_Status==0 & counts>18000, T, F)) %>% 
+  mutate(night_flag=ifelse(hour<6 & hour>21 & counts>4200  & max_flag==F, T, F)) %>%
+  mutate(counts = ifelse(max_flag==T | night_flag==T, NA, counts)) %>%
+  group_by(season, year, (hour>=6 & hour<=21), max_flag) %>%
+  mutate(MAD_flag_threshold =median(counts)+12*mad(counts)) %>%
+  mutate(MAD_flag = counts>MAD_flag_threshold & max_flag==F & hour>=6 & hour<=21 & counts>2000) %>%
+  dplyr::ungroup() %>%
+  mutate(comb_flag = max_flag | night_flag | MAD_flag) %>%
+  dplyr::group_by(ID,year,month,day,hour) %>% 
+  dplyr::mutate(comb_flag_day_count=sum(comb_flag)) %>%
+  dplyr::ungroup() %>%
+  mutate(comb_flag_day = ifelse(comb_flag_day_count <= 8, F, T))
+
+input_data_flagged1=input_data_flagged %>% filter(comb_flag==T)
+input_data_unflagged1=input_data_flagged %>% filter(comb_flag==F)
+#In the sample we provided, two counts were flagged. The additional variables "comb_flag_day_count" and "comb_flag_day" are used later in our imputations process. Day count justs counts flags on a given day, and the boolean is for sorting based on days that have less or more than 8 flags. Our imputation procedure is defferent for days with more than 8 flags vs. less.
+
+
+
+```
+
+
+
+# save flagged and unflagged data for modeling
+```{r}
+write.csv(input_data_flagged1,'C:/UC Berkeley Project Backup/AT Census/Lindsey _QA/QC Article Analysis/ped_flagged_data.csv')
+write.csv(input_data_unflagged1,'C:/UC Berkeley Project Backup/AT Census/Lindsey _QA/QC Article Analysis/ped_unflagged_data.csv')
+
+```
+
